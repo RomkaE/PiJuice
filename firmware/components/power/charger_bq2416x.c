@@ -64,6 +64,9 @@
 #define CHG_RETRY_PERIOD_MS     30000  // CHG_ST_LOST: how often a written-off device is retried
 #define CHG_POWER_ON_DELAY_MS   100    // the device needs this much after power on
 
+#define CHG_IN_CONFIRM_MS       1000
+#define CHG_IN_RECHECK_MS       100
+
 #define CHG_INIT_ATTEMPTS       5      // bring-up tries before the device is declared absent
 #define CHG_ERR_LIMIT           5      // consecutive failed rounds that drop ACTIVE to LOST
 
@@ -78,6 +81,13 @@
 
 _Static_assert(pdMS_TO_TICKS(CHG_ACTIVE_PERIOD_MS) >= 1,
                "CHG_ACTIVE_PERIOD_MS must be at least one RTOS tick");
+
+// A window that does not outlast one re-read is decided by a single reading, which is the thing
+// the debounce exists to avoid.
+_Static_assert(CHG_IN_CONFIRM_MS > CHG_IN_RECHECK_MS,
+               "the confirmation window must span more than one re-read");
+_Static_assert(pdMS_TO_TICKS(CHG_IN_RECHECK_MS) >= 1,
+               "CHG_IN_RECHECK_MS must be at least one RTOS tick");
 
 typedef enum
 {
@@ -161,14 +171,26 @@ static const uint8_t s_WritableMask[BQ_REG_COUNT] = BQ_WRITABLE_MASK_INIT;
 static const uint8_t s_InvariantMask[BQ_REG_COUNT]  = { 0x80, 0, 0x80, 0, 0xF8, 0, 0, 0 };
 static const uint8_t s_InvariantValue[BQ_REG_COUNT] = { 0x00, 0, 0x80, 0, 0x40, 0, 0, 0 };
 
+// in_stat is spelled out because its zero is CHG_IN_NORMAL - "a healthy source", which is not
+// what an unread device should look like to anything that grades one.
 static ChargerSnapshot_t s_Snapshot = {
     .status = CHG_STATUS_NA,
-    .fault = CHG_FAULT_UNKNOWN };
+    .fault = CHG_FAULT_UNKNOWN,
+    .in_stat = CHG_IN_UVLO };
 
 // Whether s_Snapshot holds a reading at all. It starts out - and goes back to, through
 // PublishUnknown() - "nothing is known", where batt_present reads 0 like an absent pack. Edges
 // must not be taken against that, see DeviceRound().
 static bool s_SnapshotKnown;
+
+// A source seen but not published yet: the window InputPresenceDebounce() is waiting out. reads
+// counts the readings taken inside it, and its zero is what says there is no window open - the
+// reset value, and the only state in which first_read means nothing.
+static struct
+{
+  uint16_t reads;
+  TickType_t first_read;
+} s_InCandidate;
 
 // Everything that decides what the device should hold. Written by cmdProcess() and read by
 // buildTargetImage(), and by nothing else. The raw configuration bytes are not kept - APP holds
@@ -330,6 +352,132 @@ static uint8_t RegulationVoltage(const ChargerConfig_t *_p_cfg)
   return (uint8_t)code;
 }
 
+static bool IsVinPresentStatus(ChargerStatus_t _status)
+{
+  return (_status == CHG_STATUS_IN_READY ||
+          _status == CHG_STATUS_CHARGING_FROM_IN ||
+          _status == CHG_STATUS_CHARGE_DONE );
+}
+
+// Both STAT values that name the USB input. Neither is possible on this board: that pin is fed by
+// the 5V boost, so anything the device draws through it comes out of the pack itself, and the
+// lockout that forbids it sits in the target image and is written and verified every round, see
+// BQ_OTG_LOCK_IMAGE. Reading one of them means the lockout is gone - a watchdog expiry into
+// DEFAULT mode is how that happens, and DEFAULT mode clears OTG_LOCK with everything else.
+static bool IsVusbPresentStatus(ChargerStatus_t _status)
+{
+  return (_status == CHG_STATUS_USB_READY ||
+          _status == CHG_STATUS_CHARGING_FROM_USB);
+}
+
+// Refuses a reading that names the USB input, see IsVusbPresentStatus(). It goes out as no source
+// at all, which is what the board has - the only thing on that pin is our own boost.
+//
+// input_present is cleared with it. IsVinPresentStatus() already leaves it false for both of
+// these, so this is belt and braces - but it is the flag power_manager gates the VBAT cutoff on,
+// and a pack feeding itself through the boost must never be what keeps that cutoff switched off.
+//
+// Nothing else is done about it here. Step 4 of the round finds register 1 short of the image and
+// writes the lockout back, which is the whole repair.
+static void StatusRefuseUsbInput(ChargerSnapshot_t *_p_snapshot)
+{
+  bool refuse = IsVusbPresentStatus(_p_snapshot->status);
+
+  // Both edges, once each: the round repeats every second and an episode can stand for several.
+  // How long it stood is the useful half - it says whether the lockout came back on the next
+  // round, as it should, or the device sat in DEFAULT mode.
+  #if LOG_ENABLED
+  static TickType_t since;
+  static bool refused;
+
+  if (refuse && !refused)
+  {
+    since = xTaskGetTickCount();
+    LOG_ERROR("[CHG] %s refused: USB-IN is locked out, OTG_LOCK lost",
+        ChargerStatus2Str(_p_snapshot->status));
+  }
+  else if (!refuse && refused)
+  {
+    LOG_WARNING("[CHG] USB-IN status gone after %u ms, device now %s",
+        (unsigned)((xTaskGetTickCount() - since) * portTICK_PERIOD_MS),
+        ChargerStatus2Str(_p_snapshot->status));
+  }
+
+  refused = refuse;
+  #endif /* LOG_ENABLED */
+
+  if (!refuse)
+    return;
+
+  _p_snapshot->status = CHG_STATUS_NO_VALID_SOURCE;
+  _p_snapshot->input_present = false;
+}
+
+static uint32_t CandidateAgeMs(TickType_t _now)
+{
+  return (uint32_t)(_now - s_InCandidate.first_read) * portTICK_PERIOD_MS;
+}
+
+static void InputPresenceDebounceReset(void)
+{
+  s_InCandidate.reads = 0;
+}
+
+// Decides whether input_present may go up, see CHG_IN_CONFIRM_MS. One thing is doubted: a source
+// appearing where the published flag says there is none. It going away is published at once, and
+// so is everything INSTAT and the DPM bit say about the source that is there - what is filtered
+// is the presence, not the quality of it.
+//
+// Nothing is exempt, the first reading after a reset least of all: "we have never read the device
+// before" is not a reason to trust what it says.
+//
+// The status that carries the claim goes out with it - held back or not, both come off the same
+// STAT field, so publishing one without the other would make the pair disagree.
+static void InputPresenceDebounce(ChargerSnapshot_t *_p_snapshot)
+{
+  TickType_t now = xTaskGetTickCount();
+
+  // Not an edge, a disagreement: the device claims a source, what stands says there is none. It
+  // holds for the whole window - the published value is kept below until the window runs out.
+  bool input_pending = _p_snapshot->input_present && !s_Snapshot.input_present;
+  if (!input_pending)
+  {
+    if (s_InCandidate.reads != 0)   // one was being waited out
+    {
+      LOG_WARNING("[CHG] Input status DROPPED after %u ms / %u reads",
+          (unsigned)CandidateAgeMs(now), (unsigned)s_InCandidate.reads);
+
+      InputPresenceDebounceReset();
+    }
+
+    return;   // published as read
+  }
+
+  // No window yet, this reading opens one:
+  if (s_InCandidate.reads == 0)
+    s_InCandidate.first_read = now;
+  s_InCandidate.reads++;
+
+  if (CandidateAgeMs(now) >= CHG_IN_CONFIRM_MS)
+  {
+    LOG_INFO("[CHG] Input status CONFIRMED after %u ms / %u reads",
+        (unsigned)CandidateAgeMs(now), (unsigned)s_InCandidate.reads);
+
+    InputPresenceDebounceReset();
+    return;   // goes out as read
+  }
+
+  _p_snapshot->input_present = false;            // no source, as it stands
+  _p_snapshot->status = s_Snapshot.status;       // and the claim that came with it
+}
+
+// How long until the next round. It follows the debounce: while a candidate is being confirmed
+// the device is re-read every CHG_IN_RECHECK_MS, so a flash that collapses is seen collapsing.
+static TickType_t NextRoundPeriod(void)
+{
+  return pdMS_TO_TICKS(s_InCandidate.reads != 0 ? CHG_IN_RECHECK_MS : CHG_ACTIVE_PERIOD_MS);
+}
+
 static void PublishChanges(const ChargerSnapshot_t *_p_snapshot)
 {
   uint8_t changed = 0;
@@ -397,11 +545,15 @@ static void PublishChanges(const ChargerSnapshot_t *_p_snapshot)
 // itself on every value rather than only on the two presence flags. Everything the initialiser
 // leaves out reads as zero, which is what "we cannot see it any more" should look like: both
 // presence flags go false and the consumers are told, rather than left holding a stale truth.
+//
+// in_stat is the one field zero does not say that for - see the s_Snapshot initialiser.
 static void PublishUnknown(void)
 {
   ChargerSnapshot_t snapshot = { .status = CHG_STATUS_NA,
-                                 .fault = CHG_FAULT_UNKNOWN };
+                                 .fault = CHG_FAULT_UNKNOWN,
+                                 .in_stat = CHG_IN_UVLO };
   s_SnapshotKnown = false;
+  InputPresenceDebounceReset();
   PublishChanges(&snapshot);
 }
 
@@ -440,8 +592,7 @@ static ChargerSnapshot_t DeviceRegsDecode(void)
 
   // From STAT, not from INSTAT: INSTAT tells how good the IN pin looks (OVP, weak, UVLO), while
   // STAT is the device's own verdict on whether a source was accepted and selected.
-  decoded.input_present = (reg_status.rd.status > CHG_STATUS_NO_VALID_SOURCE)
-                       && (reg_status.rd.status < CHG_STATUS_NA);
+  decoded.input_present = IsVinPresentStatus(decoded.status);   // raw, never debounced
 
   decoded.dpm_stat =  s_DeviceRegs.reg.vin_dpm.rd.dpm_status;
 
@@ -792,7 +943,10 @@ static bool DeviceRound(uint8_t _dump_level)
 
   // 1. Get snapshot:
   if (!RegsMapRead())
+  {
+    InputPresenceDebounceReset();   // nothing was read, nothing to confirm and nothing to pace
     return false;
+  }
 
   // Diagnostics: the state as found, before step 4 writes anything over it.
   #if LOG_ENABLED
@@ -801,6 +955,10 @@ static bool DeviceRound(uint8_t _dump_level)
 
   // 2. Snapshot -> values, no side effects:
   ChargerSnapshot_t snapshot = DeviceRegsDecode();
+
+  // 2a. Refuse what the board forbids, then hold an unconfirmed source back:
+  StatusRefuseUsbInput(&snapshot);
+  InputPresenceDebounce(&snapshot);
 
   // Taken before the publish, which is what moves s_Snapshot on. A pack appearing is one of the
   // moments the device has to be taken through high impedance, see ShouldEnterHiZ().
@@ -925,7 +1083,7 @@ static ChargerState_t state_Active(const ChargerEvent_t *_ev)
     // "return" here means "stay and skip the round below", not a transition.
     case CHG_EV_ENTRY:
       LOG_INFO("[CHG] state ACTIVE, round every %u ms", (unsigned)CHG_ACTIVE_PERIOD_MS);
-      s_StateTimeout = pdMS_TO_TICKS(CHG_ACTIVE_PERIOD_MS);
+      s_StateTimeout = NextRoundPeriod();   // INIT's round may have left a candidate standing
       err_count = 0;
       diag_Clear(DIAG_CHG_UNREACHABLE);   // answering again
       return CHG_ST_ACTIVE;
@@ -944,7 +1102,10 @@ static ChargerState_t state_Active(const ChargerEvent_t *_ev)
   }
 
   // Everything else ends the same way: push whatever changed into the device now.
-  if (DeviceRound(LOG_LEVEL_VERBOSE))
+  bool round_ok = DeviceRound(LOG_LEVEL_VERBOSE);
+  s_StateTimeout = NextRoundPeriod();
+
+  if (round_ok)
   {
     err_count = 0;
     return CHG_ST_ACTIVE;

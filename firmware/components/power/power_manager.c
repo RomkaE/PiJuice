@@ -203,13 +203,22 @@ void pwr_mngr_SetBatProfile(const BatteryProfile_T *_p_profile)
 }
 
 // Derived, not stored: the charger already publishes everything this needs, ISR safe.
+//
+// Presence and quality are two questions and they come from two places. Whether a source is there
+// is charger_IsInputPresent() and nothing else - one answer, taken apart from the device's mixed
+// STAT field once and debounced there. INSTAT and the DPM bit only grade the source that is
+// there: on their own they describe the pin, not the device's verdict on it, and INSTAT reads
+// NORMAL for a pin nothing has been plugged into.
 PowerSourceStatus_t pwr_mngr_GetInStatus(void)
 {
-  ChargerInputStatus_t status = charger_GetInStatus();
-  if (status == CHG_IN_UVLO)
+  if (!charger_IsInputPresent())
     return PWR_SOURCE_NOT_PRESENT;
-  if (status == CHG_IN_OVP || status == CHG_IN_WEAK)
+
+  // UVLO belongs here too: with a source accepted it contradicts the verdict above, and a
+  // contradiction is not a healthy input.
+  if (charger_GetInStatus() != CHG_IN_NORMAL)
     return PWR_SOURCE_BAD;
+
   if (charger_GetDpmStatus())
     return PWR_SOURCE_WEAK;
 
