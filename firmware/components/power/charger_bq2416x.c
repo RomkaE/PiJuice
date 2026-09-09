@@ -64,7 +64,7 @@
 #define CHG_RETRY_PERIOD_MS     30000  // CHG_ST_LOST: how often a written-off device is retried
 #define CHG_POWER_ON_DELAY_MS   100    // the device needs this much after power on
 
-#define CHG_IN_CONFIRM_MS       1000
+#define CHG_IN_CONFIRM_MS       2000
 #define CHG_IN_RECHECK_MS       100
 
 #define CHG_INIT_ATTEMPTS       5      // bring-up tries before the device is declared absent
