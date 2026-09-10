@@ -238,7 +238,8 @@ void charger_SnapshotChanged_Callback(const ChargerSnapshot_t *_p_snapshot, uint
   if (_changed & CHG_CHANGED_INPUT_PRESENT)
   {
     AppEvent_t event = { .type = APP_EVT_CHRGR_INPUT_PRESENCE,
-                         .chargerInput.present = _p_snapshot->input_present };
+                         .chargerInput.present = _p_snapshot->input_present,
+                         .chargerInput.found = (_changed & CHG_CHANGED_INPUT_FOUND) != 0 };
     app_PostEvent(&event);
   }
 
@@ -435,26 +436,26 @@ static bool IsWakeupOnChargeAllowed(ChargerStatus_t _chrgr_status, uint16_t _rso
 {
   if (!s_WakeupOnChargeArmed)
   {
-    LOG_WARNING("[APP] Wake-up rejected: NOT ARMED");
+    LOG_DEBUG("[APP] Wake-up rejected: NOT ARMED");
     return false;
   }
 
   if (_chrgr_status != CHG_STATUS_CHARGING_FROM_IN && _chrgr_status != CHG_STATUS_CHARGE_DONE)
   {
-    LOG_WARNING("[APP] Wake-up rejected: chrgr status=%u", (unsigned)_chrgr_status);
+    LOG_DEBUG("[APP] Wake-up rejected: chrgr status=%u", (unsigned)_chrgr_status);
     return false;
   }
 
   if (_rsoc == FUEL_GAUGE_RSOC_UNKNOWN)
   {
-    LOG_WARNING("[APP] Wake-up rejected: RSOC_UNKNOWN");
+    LOG_DEBUG("[APP] Wake-up rejected: RSOC_UNKNOWN");
     return false;
   }
 
   uint16_t rsoc_min = WakeupChargeConfig2Percent(s_WakeupOnChargeConfig);
   if (_rsoc < rsoc_min)
   {
-    LOG_WARNING("[APP] Wake-up rejected: rsoc=%u.%u%%, rsoc_min=%u.%u%%",
+    LOG_DEBUG("[APP] Wake-up rejected: rsoc=%u.%u%%, rsoc_min=%u.%u%%",
         (unsigned)(_rsoc / 10), (unsigned)(_rsoc % 10),
         (unsigned)(rsoc_min / 10), (unsigned)(rsoc_min % 10));
     return false;
@@ -745,8 +746,10 @@ static AppState_t state_Off(const AppEvent_t *_evt)
     break;
 
     case APP_EVT_CHRGR_INPUT_PRESENCE:
-      // Any external power source state change allows wake-up on charge:
-      SetWakeupOnChargeArmed(true);
+      /* Any external power source state change allows wake-up on charge. A source found on the
+       * charger's first reading after an MCU reset is not one: the retained arm stands. */
+      if (!_evt->chargerInput.found)
+        SetWakeupOnChargeArmed(true);
     break;
 
     case APP_EVT_CHRGR_STATUS:

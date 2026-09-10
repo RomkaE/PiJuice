@@ -64,7 +64,7 @@
 #define CHG_RETRY_PERIOD_MS     30000  // CHG_ST_LOST: how often a written-off device is retried
 #define CHG_POWER_ON_DELAY_MS   100    // the device needs this much after power on
 
-#define CHG_IN_CONFIRM_MS       2000
+#define CHG_IN_CONFIRM_MS       3000
 #define CHG_IN_RECHECK_MS       100
 
 #define CHG_INIT_ATTEMPTS       5      // bring-up tries before the device is declared absent
@@ -190,6 +190,7 @@ static struct
 {
   uint16_t reads;
   TickType_t first_read;
+  bool found;   // the window opened on the reading that seeds s_Snapshot, see DeviceRound()
 } s_InCandidate;
 
 // Everything that decides what the device should hold. Written by cmdProcess() and read by
@@ -433,7 +434,10 @@ static void InputPresenceDebounceReset(void)
 //
 // The status that carries the claim goes out with it - held back or not, both come off the same
 // STAT field, so publishing one without the other would make the pair disagree.
-static void InputPresenceDebounce(ChargerSnapshot_t *_p_snapshot)
+//
+// Returns true when the source it confirms was already there on the first reading: it was found,
+// it did not appear - a reset with a charger plugged in is not a plug-in.
+static bool InputPresenceDebounce(ChargerSnapshot_t *_p_snapshot)
 {
   TickType_t now = xTaskGetTickCount();
 
@@ -450,12 +454,15 @@ static void InputPresenceDebounce(ChargerSnapshot_t *_p_snapshot)
       InputPresenceDebounceReset();
     }
 
-    return;   // published as read
+    return false;   // published as read
   }
 
   // No window yet, this reading opens one:
   if (s_InCandidate.reads == 0)
+  {
     s_InCandidate.first_read = now;
+    s_InCandidate.found = !s_SnapshotKnown;
+  }
   s_InCandidate.reads++;
 
   if (CandidateAgeMs(now) >= CHG_IN_CONFIRM_MS)
@@ -463,12 +470,14 @@ static void InputPresenceDebounce(ChargerSnapshot_t *_p_snapshot)
     LOG_INFO("[CHG] Input status CONFIRMED after %u ms / %u reads",
         (unsigned)CandidateAgeMs(now), (unsigned)s_InCandidate.reads);
 
+    bool found = s_InCandidate.found;
     InputPresenceDebounceReset();
-    return;   // goes out as read
+    return found;   // goes out as read
   }
 
   _p_snapshot->input_present = false;            // no source, as it stands
   _p_snapshot->status = s_Snapshot.status;       // and the claim that came with it
+  return false;
 }
 
 // How long until the next round. It follows the debounce: while a candidate is being confirmed
@@ -478,7 +487,7 @@ static TickType_t NextRoundPeriod(void)
   return pdMS_TO_TICKS(s_InCandidate.reads != 0 ? CHG_IN_RECHECK_MS : CHG_ACTIVE_PERIOD_MS);
 }
 
-static void PublishChanges(const ChargerSnapshot_t *_p_snapshot)
+static void PublishChanges(const ChargerSnapshot_t *_p_snapshot, bool _input_found)
 {
   uint8_t changed = 0;
 
@@ -521,9 +530,11 @@ static void PublishChanges(const ChargerSnapshot_t *_p_snapshot)
 
   if (s_Snapshot.input_present != _p_snapshot->input_present)
   {
-    LOG_INFO("[CHG] Input present: %u->%u", (unsigned)s_Snapshot.input_present,
-                                            (unsigned)_p_snapshot->input_present);
+    LOG_INFO("[CHG] Input present: %u->%u%s", (unsigned)s_Snapshot.input_present,
+        (unsigned)_p_snapshot->input_present, _input_found ? " (found at start)" : "");
     changed |= CHG_CHANGED_INPUT_PRESENT;
+    if (_input_found)
+      changed |= CHG_CHANGED_INPUT_FOUND;
   }
 
   if (s_Snapshot.dpm_stat != _p_snapshot->dpm_stat)
@@ -554,7 +565,7 @@ static void PublishUnknown(void)
                                  .in_stat = CHG_IN_UVLO };
   s_SnapshotKnown = false;
   InputPresenceDebounceReset();
-  PublishChanges(&snapshot);
+  PublishChanges(&snapshot, false);
 }
 
 // CHG_INCFG_PRECEDENCE and CHG_INCFG_GPIO_IN_EN are deliberately not read - both are fixed by the
@@ -958,7 +969,7 @@ static bool DeviceRound(uint8_t _dump_level)
 
   // 2a. Refuse what the board forbids, then hold an unconfirmed source back:
   StatusRefuseUsbInput(&snapshot);
-  InputPresenceDebounce(&snapshot);
+  bool input_found = InputPresenceDebounce(&snapshot);
 
   // Taken before the publish, which is what moves s_Snapshot on. A pack appearing is one of the
   // moments the device has to be taken through high impedance, see ShouldEnterHiZ().
@@ -971,7 +982,7 @@ static bool DeviceRound(uint8_t _dump_level)
   s_SnapshotKnown = true;
 
   // 3. Compare and publish:
-  PublishChanges(&snapshot);
+  PublishChanges(&snapshot, input_found);
 
   // 4. Write back what differs
   return RegsMapSync(batt_appeared);

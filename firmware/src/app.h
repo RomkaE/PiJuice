@@ -77,6 +77,7 @@ typedef struct
 typedef struct
 {
   bool present;
+  bool found;      // there on the charger's first reading after a reset, not plugged in
 } AppEventChargerInput_t;
 
 /* Raw BATSTAT edge from the charger - battery.c turns it into "is a pack present". */

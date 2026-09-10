@@ -110,6 +110,7 @@ void charger_SetThermalState(BatteryThermalState_T state);
 #define CHG_CHANGED_BATT_PRESENT  0x08
 #define CHG_CHANGED_DPM_STATUS    0x10
 #define CHG_CHANGED_INPUT_PRESENT 0x20
+#define CHG_CHANGED_INPUT_FOUND   0x40   // qualifies INPUT_PRESENT: there on the first reading, not plugged in
 
 /* The mask is what the publisher already computes to log the transitions, so the consumer does not
  * have to keep a second mirror of the snapshot just to rediscover it. */
